@@ -73,6 +73,7 @@ import {
 } from "../utils/async/withTimeout.js";
 import {
   composeAbortSignals,
+  composeAbortSignalsScoped,
   createTimeoutController,
   TimeoutError,
 } from "../utils/timeout.js";
@@ -359,6 +360,32 @@ export abstract class BaseProvider implements AIProvider {
     await this.ensureModelLimits();
     let options = this.normalizeStreamOptions(optionsOrPrompt);
 
+    // Own an abort signal for this call so teardown can reach the transport.
+    //
+    // #1550 gave teardown a way to close the iterator chain, but closing an
+    // iterator does not cancel the HTTP request underneath it — the provider
+    // read stays pending and the connection stays open. Providers already
+    // honour `options.abortSignal` and pass it to their transport; nothing
+    // ever fired one on abandonment, because the only signal available was
+    // the caller's and the caller had simply walked away.
+    //
+    // Composed rather than substituted, so a caller's own signal keeps
+    // working exactly as before and either source can end the request.
+    // Scoped, not plain `composeAbortSignals`: that one is `AbortSignal.any`,
+    // whose registration on a source survives until the DERIVED signal is
+    // collected. A caller that reuses one long-lived `abortSignal` across many
+    // stream calls would accumulate a dependent per call on it, released only
+    // by GC — the exact hazard composeAbortSignalsScoped was written for (see
+    // its docstring: MaxListenersExceededWarning at 10+ compositions). It
+    // registers removable listeners and hands back a `dispose()`, which
+    // `teardown()` calls when the stream settles.
+    const teardownController = new AbortController();
+    const { signal: composedStreamSignal, dispose: disposeComposedSignal } =
+      composeAbortSignalsScoped(options.abortSignal, teardownController.signal);
+    if (composedStreamSignal !== options.abortSignal) {
+      options = { ...options, abortSignal: composedStreamSignal };
+    }
+
     // Before anything else, and before a single byte leaves the process: an
     // execution policy this provider cannot honour is an error, and a policy
     // whose shape could be read two ways is an error. Both are silent bugs at
@@ -413,7 +440,12 @@ export abstract class BaseProvider implements AIProvider {
           options,
           analysisSchema,
         );
-        return this.wrapStreamWithLifecycleCallbacks(fakeResult, options);
+        return this.wrapStreamWithLifecycleCallbacks(
+          fakeResult,
+          options,
+          teardownController,
+          disposeComposedSignal,
+        );
       }
     }
 
@@ -440,7 +472,12 @@ export abstract class BaseProvider implements AIProvider {
         options,
         analysisSchema,
       );
-      return this.wrapStreamWithLifecycleCallbacks(fakeResult, options);
+      return this.wrapStreamWithLifecycleCallbacks(
+        fakeResult,
+        options,
+        teardownController,
+        disposeComposedSignal,
+      );
     }
 
     // Central tool merge: Pre-merge base tools (MCP/built-in) with user-provided
@@ -482,6 +519,8 @@ export abstract class BaseProvider implements AIProvider {
       return this.wrapStreamWithLifecycleCallbacks(
         this.withStreamModelFallback(realStreamResult, options, analysisSchema),
         options,
+        teardownController,
+        disposeComposedSignal,
       );
     } catch (realStreamError) {
       // Retired-model fallback runs FIRST, before any lifecycle callback has
@@ -493,6 +532,8 @@ export abstract class BaseProvider implements AIProvider {
         realStreamError,
         options,
         analysisSchema,
+        teardownController,
+        disposeComposedSignal,
       );
       if (recovered) {
         return recovered;
@@ -544,7 +585,12 @@ export abstract class BaseProvider implements AIProvider {
           options,
           analysisSchema,
         );
-        return this.wrapStreamWithLifecycleCallbacks(fakeResult, options);
+        return this.wrapStreamWithLifecycleCallbacks(
+          fakeResult,
+          options,
+          teardownController,
+          disposeComposedSignal,
+        );
       } else {
         // If real streaming failed and no tools are enabled, fire onError
         // before re-throwing so consumer-supplied callbacks see the failure.
@@ -747,6 +793,8 @@ export abstract class BaseProvider implements AIProvider {
     error: unknown,
     options: StreamOptions,
     analysisSchema: ValidationSchema | undefined,
+    teardownController?: AbortController,
+    disposeComposedSignal?: () => void,
   ): Promise<StreamResult | undefined> {
     if (options.disableInternalFallback === true) {
       return undefined;
@@ -768,7 +816,12 @@ export abstract class BaseProvider implements AIProvider {
       this.refreshHandlersForModel(candidate);
       try {
         const result = await this.executeStream(options, analysisSchema);
-        return this.wrapStreamWithLifecycleCallbacks(result, options);
+        return this.wrapStreamWithLifecycleCallbacks(
+          result,
+          options,
+          teardownController,
+          disposeComposedSignal,
+        );
       } catch {
         // Any failure on a candidate — stale id or otherwise — just moves to
         // the next one. Nothing is reported from here: if none succeed the
@@ -793,10 +846,20 @@ export abstract class BaseProvider implements AIProvider {
    * over /api/chat, custom OpenAI-compatible servers, etc). Wrapping the
    * user-facing stream here ensures the callbacks fire regardless of the
    * underlying transport.
+   *
+   * `teardownController`, when supplied, is the call's own abort source (see
+   * `stream()`): the cancel hook fires it on abandonment so the transport's
+   * in-flight HTTP request is cancelled, not just this iterator chain.
    */
   private wrapStreamWithLifecycleCallbacks(
     result: StreamResult,
     options: StreamOptions,
+    teardownController?: AbortController,
+    // Releases the scoped composition in stream() that put this call's
+    // teardown signal alongside the caller's. Runs from teardown(), so the
+    // listeners come off the caller's (possibly long-lived) signal the
+    // moment this stream settles rather than whenever GC gets to it.
+    disposeComposedSignal?: () => void,
   ): StreamResult {
     const lifecycle = getLifecycleMiddlewareConfig(options);
 
@@ -853,6 +916,31 @@ export abstract class BaseProvider implements AIProvider {
       [Symbol.asyncIterator]: () => upstreamIterator,
     };
 
+    // Set by teardown, read by the generator's catch. Distinguishes "the
+    // provider failed" from "we aborted the provider because the consumer
+    // abandoned this stream", which must not be reported as a failure.
+    let teardownRequested = false;
+    let teardownDone = false;
+
+    // Shared by both teardown entry points below (native `.return()` via the
+    // `finally`, and the `attachStreamCancel` hook for a consumer parked
+    // mid-`await` that a queued `.return()` cannot reach promptly). Guarded
+    // so whichever fires first does the work exactly once.
+    const teardown = (): void => {
+      if (teardownDone) {
+        return;
+      }
+      teardownDone = true;
+      teardownRequested = true;
+      // Abort before closing the iterators. The iterator close releases our
+      // side of the chain; this releases the provider's — the in-flight HTTP
+      // request that a closed iterator leaves running.
+      teardownController?.abort();
+      disposeComposedSignal?.();
+      cancelStream(originalStream);
+      releaseIterator(upstreamIterator);
+    };
+
     const wrappedStream = (async function* () {
       let accumulated = "";
       let seq = 0;
@@ -897,6 +985,14 @@ export abstract class BaseProvider implements AIProvider {
         }
       } catch (error) {
         const err = error instanceof Error ? error : new Error(String(error));
+        if (teardownRequested) {
+          // Our own abort, from a consumer that already broke out of this
+          // stream. Firing onError would report cleanup as a provider failure,
+          // and rethrowing would surface an error nobody is left to catch —
+          // an unhandled rejection, which terminates the process. Ending the
+          // generator quietly is the correct outcome for an abandoned stream.
+          return;
+        }
         if (onError && !hasLifecycleErrorFired(err)) {
           // Mark before firing so a higher layer that also routes through
           // fireLifecycleErrorCallback (or its own lifecycle wrapper) with
@@ -914,6 +1010,21 @@ export abstract class BaseProvider implements AIProvider {
           );
         }
         throw classifyStreamError(err);
+      } finally {
+        // Unconditional and safe: `teardown()` is idempotent (guarded by
+        // `teardownDone`), and `cancelStream`/`releaseIterator` are
+        // documented as no-ops on an already-finished stream/iterator, so
+        // calling it again after normal completion or a real provider error
+        // (both of which reach here too) costs nothing. The path that
+        // actually needs it is a consumer breaking out of `for await` while
+        // this generator is parked right after a `yield` — that unwinds
+        // straight here, bypassing both the rest of the `try` and the
+        // `catch` above, since a native `.return()` is a "return"
+        // completion, not a thrown error. Closing the iterator chain (done
+        // automatically by `for-await-of`'s own `IteratorClose` on
+        // `upstreamIterable`) does not cancel the HTTP request underneath
+        // it, so the transport is aborted here explicitly.
+        teardown();
       }
     })();
 
@@ -921,11 +1032,12 @@ export abstract class BaseProvider implements AIProvider {
     // through `.return()` while it is parked awaiting the provider — that
     // request queues behind the in-flight `next()`. The hook closes the
     // upstream directly and forwards the request to any wrapper below, so
-    // abandoning a stream really does release the provider connection.
-    attachStreamCancel(wrappedStream, () => {
-      cancelStream(originalStream);
-      releaseIterator(upstreamIterator);
-    });
+    // abandoning a stream really does release the provider connection. This
+    // is the fallback path for that case; the common case (a consumer that
+    // breaks right after receiving a chunk, so this generator is parked at
+    // the `yield` rather than mid-`await`) is handled by the `finally`
+    // above, which reaches `.return()` synchronously.
+    attachStreamCancel(wrappedStream, teardown);
 
     // See the comment in withStreamModelFallback above: this spread must not
     // be allowed to freeze a provider's lazy toolsUsed/toolExecutions getters.
