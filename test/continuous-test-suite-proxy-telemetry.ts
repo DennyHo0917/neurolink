@@ -2174,6 +2174,11 @@ await test("size retention preserves the current supervisor journal and still re
 });
 
 await test("default shutdown flush waits for a capture beyond the metadata-only five-second budget", async () => {
+  assertEqual(
+    __requestLoggerTestHooks.defaultFlushTimeoutMs,
+    30_000,
+    "request-log flush no longer fits inside launchd's 45-second exit budget",
+  );
   const { pathToFileURL } = await import("node:url");
   const dir = await mkdtemp(join(tmpdir(), "capture-shutdown-"));
   const fixture = join(dir, "delayed-worker.mjs");
@@ -2703,7 +2708,7 @@ function otelAttribute(
   return value?.stringValue ?? value?.intValue ?? value?.boolValue;
 }
 
-await test("a burst exceeding the old body queue reconstructs every capture after delayed collector acknowledgements", async () => {
+await test("OTel admission waits through byte pressure and reconstructs every capture", async () => {
   await withBodyCollector(
     async (_records, response) => {
       await pause(20);
@@ -2713,7 +2718,10 @@ await test("a burst exceeding the old body queue reconstructs every capture afte
       const { flushProxyOtelLogs, getProxyOtelLogSnapshot } =
         await import("../src/lib/proxy/otelLogSink.js");
       const { createHash } = await import("node:crypto");
-      const bodies = Array.from({ length: 8 }, (_, i) => ({
+      // Each clone is roughly 3 MiB because strings are retained as UTF-16.
+      // Twelve captures cross the 32 MiB active pool and exercise the bounded
+      // OTel overflow queue seen in production without increasing that pool.
+      const bodies = Array.from({ length: 12 }, (_, i) => ({
         message: String(i) + "x".repeat(1_555_211),
         api_key: "must-be-redacted",
         nested: { password: { private: "not-exported" } },
@@ -2737,7 +2745,7 @@ await test("a burst exceeding the old body queue reconstructs every capture afte
           (r) => otelAttribute(r, "proxy.record_kind") === "body_capture_index",
         )
         .map((r) => JSON.parse(r.body.stringValue));
-      assertEqual(indexes.length, 8);
+      assertEqual(indexes.length, 12);
       for (const index of indexes) {
         assertEqual(index.bodyDelivery.status, "transport_acknowledged");
         assertEqual(
@@ -2775,7 +2783,7 @@ await test("a burst exceeding the old body queue reconstructs every capture afte
         assertEqual(body.nested.password, "[REDACTED]");
       }
       const snapshot = getProxyOtelLogSnapshot();
-      assertEqual(snapshot.bodyDelivery.transportAcknowledged, 8);
+      assertEqual(snapshot.bodyDelivery.transportAcknowledged, 12);
       assertEqual(snapshot.bodyDelivery.pending, 0);
       assertEqual(
         snapshot.queues[1].dropped,
@@ -2786,6 +2794,161 @@ await test("a burst exceeding the old body queue reconstructs every capture afte
         snapshot.queues[1].highWaterOutstanding <= 64,
         "capture pacing exceeded one batch",
       );
+      const worker = getRequestLoggerSnapshot().bodyCapture!;
+      assert(
+        worker.admissionWaits > 0,
+        "fixture did not exercise the OTel overflow admission queue",
+      );
+      assertEqual(worker.admissionTimeouts, 0);
+      assertEqual(worker.rejected, 0);
+      assertEqual(worker.waiting, 0);
+      assert(
+        worker.pendingBytes <= worker.maxPendingBytes,
+        "active capture pool exceeded its byte bound",
+      );
+      assert(
+        worker.highWaterWaitingBytes <= worker.maxWaitingBytes,
+        "overflow queue exceeded its byte bound",
+      );
+    },
+  );
+});
+
+await test("OTel admission absorbs the observed 64-slot publication burst", async () => {
+  await withBodyCollector(
+    async (_records, response) => {
+      await pause(20);
+      response.writeHead(200, { "content-type": "application/json" }).end("{}");
+    },
+    async (received) => {
+      const { flushProxyOtelLogs, getProxyOtelLogSnapshot } =
+        await import("../src/lib/proxy/otelLogSink.js");
+      const captures = Array.from({ length: 80 }, (_, index) => ({
+        timestamp: new Date().toISOString(),
+        requestId: `slot-burst-${index}`,
+        phase: "client_request" as const,
+        model: "fixture",
+        stream: false,
+        body: {
+          message: `${index}:${"x".repeat(2_048)}`,
+          api_key: "must-be-redacted",
+        },
+      }));
+
+      await Promise.all(captures.map((capture) => logBodyCapture(capture)));
+      await flushRequestLogs();
+      await flushProxyOtelLogs();
+
+      const indexes = received
+        .filter(
+          (record) =>
+            otelAttribute(record, "proxy.record_kind") === "body_capture_index",
+        )
+        .map((record) => JSON.parse(record.body.stringValue));
+      assertEqual(indexes.length, captures.length);
+      assertEqual(
+        indexes.filter(
+          (index) => index.bodyDelivery.status === "transport_acknowledged",
+        ).length,
+        captures.length,
+      );
+
+      const worker = getRequestLoggerSnapshot().bodyCapture!;
+      assertEqual(worker.highWaterPending, worker.maxPending);
+      assert(
+        worker.highWaterWaiting >= captures.length - worker.maxPending,
+        "fixture did not queue captures beyond the active 64-slot pool",
+      );
+      assertEqual(worker.admissionTimeouts, 0);
+      assertEqual(worker.rejected, 0);
+      assertEqual(worker.waiting, 0);
+      assertEqual(worker.pending, 0);
+
+      const otel = getProxyOtelLogSnapshot();
+      assertEqual(otel.bodyDelivery.transportAcknowledged, captures.length);
+      assertEqual(otel.bodyDelivery.rejected, 0);
+      assertEqual(otel.queues[1].dropped, 0);
+    },
+  );
+});
+
+await test("OTel admission lets a compatible small capture bypass a byte-blocked waiter", async () => {
+  let collectorOpen = false;
+  const blockedCollectorResponses: Array<() => void> = [];
+  const openCollector = () => {
+    collectorOpen = true;
+    for (const release of blockedCollectorResponses.splice(0)) {
+      release();
+    }
+  };
+  await withBodyCollector(
+    async (_records, response) => {
+      if (!collectorOpen) {
+        await new Promise<void>((resolve) => {
+          blockedCollectorResponses.push(resolve);
+        });
+      }
+      response.writeHead(200, { "content-type": "application/json" }).end("{}");
+    },
+    async () => {
+      const operations: Array<Promise<unknown>> = [];
+      try {
+        const active = Array.from({ length: 64 }, (_, index) =>
+          logBodyCapture({
+            timestamp: new Date().toISOString(),
+            requestId: `mixed-active-${index}`,
+            phase: "client_request",
+            model: "fixture",
+            stream: false,
+            body: { message: `${index}:${"x".repeat(240_000)}` },
+          }),
+        );
+        operations.push(...active);
+        await eventually(
+          () => getRequestLoggerSnapshot().bodyCapture?.pending === 64,
+        );
+
+        const large = logBodyCapture({
+          timestamp: new Date().toISOString(),
+          requestId: "mixed-waiter-large",
+          phase: "client_request",
+          model: "fixture",
+          stream: false,
+          body: { message: "x".repeat(5_000_000) },
+        });
+        const small = logBodyCapture({
+          timestamp: new Date().toISOString(),
+          requestId: "mixed-waiter-small",
+          phase: "client_request",
+          model: "fixture",
+          stream: false,
+          body: { message: "small" },
+        });
+        operations.push(large, small);
+        await eventually(
+          () => getRequestLoggerSnapshot().bodyCapture?.waiting === 2,
+        );
+        await eventually(() => blockedCollectorResponses.length > 0);
+
+        blockedCollectorResponses.shift()?.();
+        await eventually(
+          () =>
+            blockedCollectorResponses.length > 0 &&
+            getRequestLoggerSnapshot().bodyCapture?.waiting === 1,
+        );
+        openCollector();
+        await Promise.all(operations);
+        await flushRequestLogs();
+
+        const worker = getRequestLoggerSnapshot().bodyCapture!;
+        assertEqual(worker.admissionTimeouts, 0);
+        assertEqual(worker.rejected, 0);
+        assertEqual(worker.waiting, 0);
+        assertEqual(worker.pending, 0);
+      } finally {
+        openCollector();
+        await Promise.allSettled(operations);
+      }
     },
   );
 });
