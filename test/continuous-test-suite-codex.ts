@@ -1622,6 +1622,76 @@ await test("Claude fallback converts system, history, tools, and tool results", 
   );
 });
 
+await test("Claude fallback safely converts Claude Code tool additions", () => {
+  const addedTools = ["read_file", "write_file", "run_command"].map((name) => ({
+    type: "tool_addition" as const,
+    tool: {
+      name,
+      description: `Use ${name}.`,
+      input_schema: { type: "object", properties: {} },
+    },
+  }));
+  const request = convertClaudeRequestToCodex(
+    {
+      model: "claude-opus-5",
+      max_tokens: 1024,
+      system: "Follow the top-level policy.",
+      messages: [
+        { role: "user", content: "Start the task." },
+        { role: "assistant", content: "I will inspect it." },
+        { role: "user", content: "Continue." },
+        {
+          role: "system",
+          content: [
+            { type: "text", text: "Use newly available tools when needed." },
+            ...addedTools,
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Before." },
+            addedTools[0],
+            { type: "text", text: "After." },
+          ],
+        },
+      ],
+      tools: addedTools.map(({ tool }) => tool),
+    } as unknown as Parameters<typeof convertClaudeRequestToCodex>[0],
+    "gpt-5.6-terra",
+  );
+
+  assert(
+    !JSON.stringify(request.input).includes("null"),
+    "tool additions must not create null Codex content",
+  );
+  assertEqual(
+    request.instructions,
+    "Follow the top-level policy.\n\nUse newly available tools when needed.",
+    "inline system text was not preserved as Codex instructions",
+  );
+  assertEqual(
+    request.input.length,
+    4,
+    "inline system messages must not become Codex conversation items",
+  );
+  const finalContent = (
+    request.input[3] as { content?: Array<{ type?: string; text?: string }> }
+  ).content;
+  assertEqual(
+    finalContent?.length,
+    2,
+    "tool additions must be omitted without dropping adjacent text",
+  );
+  assertEqual(finalContent?.[0]?.text, "Before.", "leading text changed");
+  assertEqual(finalContent?.[1]?.text, "After.", "trailing text changed");
+  assertEqual(
+    request.tools?.length,
+    3,
+    "top-level tool definitions must remain available to Codex",
+  );
+});
+
 await test("Claude fallback maps automatic and required tool choices", () => {
   const base = {
     model: "claude-sonnet-4-20250514",

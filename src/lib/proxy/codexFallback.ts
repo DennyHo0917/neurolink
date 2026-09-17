@@ -42,17 +42,40 @@ function asNonEmptyString(value: unknown): string | undefined {
 }
 
 function buildSystemInstructions(body: ClaudeRequest): string | undefined {
+  const instructions: string[] = [];
   if (typeof body.system === "string") {
-    return body.system || undefined;
-  }
-  if (Array.isArray(body.system)) {
+    if (body.system) {
+      instructions.push(body.system);
+    }
+  } else if (Array.isArray(body.system)) {
     const text = body.system
       .map((block) => (typeof block.text === "string" ? block.text : ""))
       .filter(Boolean)
       .join("\n\n");
-    return text || undefined;
+    if (text) {
+      instructions.push(text);
+    }
   }
-  return undefined;
+  for (const message of body.messages) {
+    // Claude's public Messages type restricts message roles to user/assistant,
+    // but Claude Code can emit an inline system message for context-management
+    // edits. Preserve its text as instructions instead of sending a non-leading
+    // system item to the Codex conversation input.
+    if ((message.role as string) !== "system") {
+      continue;
+    }
+    const text =
+      typeof message.content === "string"
+        ? message.content
+        : message.content
+            .map((block) => (block.type === "text" ? block.text : ""))
+            .filter(Boolean)
+            .join("\n");
+    if (text) {
+      instructions.push(text);
+    }
+  }
+  return instructions.length > 0 ? instructions.join("\n\n") : undefined;
 }
 
 function imageUrlForBlock(
@@ -93,7 +116,7 @@ function flattenClaudeContent(content: string | ClaudeContentBlock[]): string {
 function toCodexContentPart(
   block: Exclude<ClaudeContentBlock, { type: "tool_use" | "tool_result" }>,
   role: "user" | "assistant",
-): CodexContentPart {
+): CodexContentPart | undefined {
   const textType = role === "assistant" ? "output_text" : "input_text";
   switch (block.type) {
     case "text":
@@ -158,7 +181,17 @@ function convertClaudeMessage(
       });
       continue;
     }
-    messageContent.push(toCodexContentPart(block, role));
+    // Claude Code context-management messages can contain `tool_addition`
+    // blocks. The live tool definitions are already carried by `body.tools`;
+    // these history markers must not become undefined array entries because
+    // JSON encodes array undefined values as null and Codex rejects them.
+    if ((block.type as string) === "tool_addition") {
+      continue;
+    }
+    const contentPart = toCodexContentPart(block, role);
+    if (contentPart) {
+      messageContent.push(contentPart);
+    }
   }
   flushMessage();
   return input;
@@ -171,7 +204,9 @@ export function convertClaudeRequestToCodex(
   reasoningEffort?: CodexReasoningEffort,
 ): CodexResponsesRequest {
   const input = body.messages.flatMap((message) =>
-    convertClaudeMessage(message.role, message.content),
+    (message.role as string) === "system"
+      ? []
+      : convertClaudeMessage(message.role, message.content),
   );
   const request: CodexResponsesRequest = {
     model,
