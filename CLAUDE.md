@@ -577,6 +577,30 @@ membership.
 The general trap: a command that exits 0 is not evidence it did anything. Check
 that the work landed — a changed file, a written artifact — not the status code.
 
+And the sharper version of that trap: the artifact **was** written, and is still
+wrong. `pnpm run docs:api` used to do exactly this whenever the checkout's
+absolute path contained a directory named `test`. `typedoc.json` excluded
+`**/test/**`, typedoc matches `exclude` against absolute paths, and
+`cleanOutputDir` wipes the output first — so every file under `src/lib/` was
+excluded, the entry point converted to an empty module, and the run deleted 3545
+of 3546 files and wrote the module README. Exit 0. No errors, no warnings,
+`markdown generated at ./docs/api`, and a working tree holding a mass deletion
+that looked like a clean regeneration.
+
+It is not a hypothetical path: `workforge create -t test -n <name>` puts the
+worktree under a directory named for the branch type, so any worktree opened for
+test work sat on it. Two worktrees at the same commit, same lockfile, same
+`tsc --listFiles` output of 4847 files, disagreed by 3545 files, and neither
+reinstalling nor rebuilding changed anything — the only difference was the path.
+
+The pattern is now anchored to the project root (`./test/**`), which cannot
+match an ancestor of the repository. When adding an `exclude`, `ignore` or
+`files` pattern to any tool config, anchor directory patterns to the root:
+a bare `**/<name>/**` is a claim about every directory between `/` and the
+repository, not just the one you meant. CI never saw this — GitHub checks out at
+`/home/runner/work/neurolink/neurolink` — which is its own lesson about where a
+path-dependent bug hides.
+
 ### ⚠️ Merging a stack: `--delete-branch` closes the child
 
 The house recipe is `gh pr merge <n> --rebase --delete-branch`, and on a
