@@ -23,6 +23,7 @@ export enum AIProviderName {
   LM_STUDIO = "lm-studio",
   LLAMACPP = "llamacpp",
   // ── BEGIN GENERATED(provider-members): provider catalog (pnpm run codegen:catalog) ──
+  API_ROUTE = "api-route",
   BASETEN = "baseten",
   CEREBRAS = "cerebras",
   CLOUDFLARE = "cloudflare",
@@ -1229,6 +1230,17 @@ export enum ReplicateModels {
 export const TOKEN_EXPIRY_BUFFER_MS = 5 * 60 * 1000; // 5 minutes
 
 // ── BEGIN GENERATED(models-enums): provider catalog (pnpm run codegen:catalog) ──
+export enum ApiRouteModels {
+  CLAUDE_SONNET_4_6 = "claude-sonnet-4-6",
+  CLAUDE_HAIKU_4_5 = "claude-haiku-4-5",
+  DEEPSEEK_V4_FLASH = "deepseek-v4-flash",
+  DEEPSEEK_V4_PRO = "deepseek-v4-pro",
+  GEMINI_3_8_FLASH = "gemini-3.8-flash",
+  QWEN3_8_FLASH = "qwen3.8-flash",
+  KIMI_K2_7_CODE = "kimi-k2.7-code",
+  GLM_5_3_FLASH = "glm-5.3-flash",
+}
+
 export enum BasetenModels {
   OPENAI_GPT_OSS_120B = "openai/gpt-oss-120b",
   ZAI_ORG_GLM_4_7 = "zai-org/GLM-4.7",

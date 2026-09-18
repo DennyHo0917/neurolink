@@ -8,7 +8,7 @@
 
 > **LiveServerMessageModelTurn** = `object`
 
-Defined in: [types/providers.ts:1103](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1103)
+Defined in: [types/providers.ts:1104](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1104)
 
 Live server message model turn
 
@@ -18,7 +18,7 @@ Live server message model turn
 
 > `optional` **parts?**: `object`[]
 
-Defined in: [types/providers.ts:1104](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1104)
+Defined in: [types/providers.ts:1105](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1105)
 
 #### inlineData?
 

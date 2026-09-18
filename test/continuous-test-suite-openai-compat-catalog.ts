@@ -140,6 +140,9 @@ const CATALOG_ENV_VARS = [
   "MANCER_API_KEY",
   "MANCER_BASE_URL",
   "MANCER_MODEL",
+  "API_ROUTE_API_KEY",
+  "API_ROUTE_BASE_URL",
+  "API_ROUTE_MODEL",
 ];
 
 function neutralizeCatalogEnv(): void {
@@ -1107,6 +1110,18 @@ const CATALOG_ALIAS_CHECKS: AliasCheck[] = [
     envVar: "MANCER_API_KEY",
     urlMatch: "neuro.mancer.tech/oai/v1/chat/completions",
     model: "deepseek-v4-flash",
+  },
+  {
+    alias: "api-route",
+    envVar: "API_ROUTE_API_KEY",
+    urlMatch: "global.api-route.com/v1/chat/completions",
+    model: "claude-sonnet-4-6",
+  },
+  {
+    alias: "apiroute",
+    envVar: "API_ROUTE_API_KEY",
+    urlMatch: "global.api-route.com/v1/chat/completions",
+    model: "claude-sonnet-4-6",
   },
 ];
 
